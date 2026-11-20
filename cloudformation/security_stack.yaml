@@ -1,0 +1,151 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Cloud Security Incident Response Monitoring Stack
+
+Resources:
+
+  # Lab S3 bucket for security testing
+  LabS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+
+  # SNS topic for security alerts
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: CloudSecurityAlerts
+
+  # IAM role for alert Lambda
+  AlertLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: PublishSecurityAlert
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda function for suspicious activity alerts
+  AlertHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CloudSecurityAlertHandler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AlertLambdaRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          sns = boto3.client("sns")
+          topic = os.environ["SNS_TOPIC_ARN"]
+
+          def lambda_handler(event, context):
+              detail = event.get("detail", {})
+              event_name = detail.get("eventName", "Unknown")
+
+              suspicious = [
+                  "PutBucketPolicy",
+                  "PutBucketAcl",
+                  "AuthorizeSecurityGroupIngress",
+                  "CreateAccessKey"
+              ]
+
+              if event_name in suspicious:
+                  message = {
+                      "alert": "Suspicious AWS activity detected",
+                      "event": event_name,
+                      "severity": "HIGH"
+                  }
+
+                  sns.publish(
+                      TopicArn=topic,
+                      Subject="AWS Security Alert",
+                      Message=json.dumps(message)
+                  )
+
+                  print(json.dumps(message))
+
+              return {"statusCode": 200}
+
+  # Monitor suspicious AWS API activity
+  SecurityEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SuspiciousAWSActivityRule
+      Description: Detect suspicious AWS API calls
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+          - aws.ec2
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+            - ec2.amazonaws.com
+            - iam.amazonaws.com
+          eventName:
+            - PutBucketPolicy
+            - PutBucketAcl
+            - AuthorizeSecurityGroupIngress
+            - CreateAccessKey
+      Targets:
+        - Arn: !GetAtt AlertHandler.Arn
+          Id: AlertLambdaTarget
+
+  # Allow EventBridge to invoke the Lambda function
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityEventRule.Arn
+
+Outputs:
+  LabBucketName:
+    Description: Lab S3 bucket name
+    Value: !Ref LabS3Bucket
+
+  AlertTopicArn:
+    Description: SNS alert topic ARN
+    Value: !Ref SecurityAlertTopic
+
+  AlertFunctionName:
+    Description: Alert Lambda function name
+    Value: !Ref AlertHandler
+
